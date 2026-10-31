@@ -1,0 +1,194 @@
+name: Desktop Windows (AnyDesk)
+
+on:
+  workflow_dispatch:
+    inputs:
+      instance_number:
+        description: 'Número da instância'
+        required: false
+        default: '1'
+        type: string
+
+jobs:
+  deploy-windows-anydesk:
+    runs-on: windows-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Gerar senha aleatória
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $chars = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789'
+          $pass = -join (1..20 | ForEach-Object {
+            $chars[[System.Security.Cryptography.RandomNumberGenerator]::GetInt32($chars.Length)]
+          })
+          "ANYDESK_PASS=$pass" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Instalar AnyDesk (com serviço)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          choco install anydesk -y --no-progress
+          if ($LASTEXITCODE -ne 0) { throw "Falha na instalação do AnyDesk (código $LASTEXITCODE)." }
+
+          $exe = @(
+            'C:\Program Files (x86)\AnyDesk\AnyDesk.exe',
+            'C:\Program Files\AnyDesk\AnyDesk.exe'
+          ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $exe) {
+            $exe = Get-ChildItem 'C:\Program Files*' -Recurse -Filter AnyDesk.exe -ErrorAction SilentlyContinue |
+              Select-Object -First 1 -ExpandProperty FullName
+          }
+          if (-not $exe) { throw 'AnyDesk.exe não foi encontrado após a instalação.' }
+          Write-Host "AnyDesk em: $exe"
+          "ANYDESK_EXE=$exe" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+          $svc = Get-Service -Name AnyDesk -ErrorAction SilentlyContinue
+          if ($svc -and $svc.Status -ne 'Running') { Start-Service AnyDesk }
+          Start-Sleep -Seconds 5
+          Get-Service -Name AnyDesk -ErrorAction SilentlyContinue | Format-List Name, Status
+
+      - name: Definir senha de acesso
+        shell: pwsh
+        run: |
+          $exe = $env:ANYDESK_EXE
+          Write-Host "Caminho do AnyDesk: $exe"
+          Write-Host "Existe: $(Test-Path $exe)"
+          if (-not (Test-Path $exe)) { throw 'AnyDesk.exe não encontrado no caminho salvo.' }
+
+          # A senha usa só letras e números, então é segura no comando do cmd
+          $out = cmd /c "echo $env:ANYDESK_PASS| `"$exe`" --set-password 2>&1"
+          $code = $LASTEXITCODE
+          Write-Host "Saída do --set-password: $out"
+          Write-Host "Código de saída: $code"
+          if ($code -ne 0) { throw "Falha ao definir a senha (código $code). Saída: $out" }
+          Write-Host 'Senha definida.'
+
+      - name: Obter ID do AnyDesk
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $id = $null
+          $trace = 'C:\ProgramData\AnyDesk\ad_svc.trace'
+
+          for ($i = 0; $i -lt 30 -and -not $id; $i++) {
+            $out = cmd /c "`"$env:ANYDESK_EXE`" --get-id 2>&1" | Out-String
+            if ($out -match '(\d{9,10})') { $id = $Matches[1]; break }
+
+            if (Test-Path $trace) {
+              $m = Select-String -Path $trace -Pattern 'Client-ID: (\d{9,10})' | Select-Object -Last 1
+              if ($m) { $id = $m.Matches[0].Groups[1].Value; break }
+            }
+            Start-Sleep -Seconds 3
+          }
+
+          if (-not $id) { throw 'Não foi possível obter o ID do AnyDesk.' }
+          "ANYDESK_ID=$id" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Write-Host 'ID obtido.'
+
+      - name: Aplicar plano de fundo e tema escuro
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+
+          # Baixa a imagem do plano de fundo
+          $url = 'https://i.postimg.cc/LsZjR2SG/file-000000001cac820ebd5bfb81ab3dde7b.png'
+          $dir = Join-Path $env:USERPROFILE 'Pictures'
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          $dest = Join-Path $dir 'plano-de-fundo.png'
+          Invoke-WebRequest -Uri $url -OutFile $dest -UseBasicParsing
+
+          # Define o plano de fundo (estilo "Preencher")
+          $desktop = 'HKCU:\Control Panel\Desktop'
+          Set-ItemProperty $desktop -Name Wallpaper -Value $dest
+          Set-ItemProperty $desktop -Name WallpaperStyle -Value '10'
+          Set-ItemProperty $desktop -Name TileWallpaper -Value '0'
+
+          Add-Type @'
+          using System.Runtime.InteropServices;
+          public class Wallpaper {
+            [DllImport("user32.dll", CharSet = CharSet.Auto)]
+            public static extern int SystemParametersInfo(int uAction, int uParam, string lpvParam, int fuWinIni);
+          }
+          '@
+          # 0x14 = SPI_SETDESKWALLPAPER, 0x03 = atualizar o registro e notificar
+          [Wallpaper]::SystemParametersInfo(0x14, 0, $dest, 0x03) | Out-Null
+
+          # Tema escuro para aplicativos e para o sistema (barra de tarefas, menu iniciar)
+          $personalize = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize'
+          New-Item -Path $personalize -Force | Out-Null
+          Set-ItemProperty $personalize -Name AppsUseLightTheme -Value 0 -Type DWord
+          Set-ItemProperty $personalize -Name SystemUsesLightTheme -Value 0 -Type DWord
+
+          # Reinicia o Explorer para aplicar o tema escuro
+          Stop-Process -Name explorer -Force -ErrorAction SilentlyContinue
+          Start-Sleep -Seconds 3
+          Start-Process explorer.exe
+          Write-Host 'Plano de fundo e tema escuro aplicados.'
+
+      - name: Evitar suspensão
+        shell: pwsh
+        run: |
+          powercfg /change standby-timeout-ac 0
+          powercfg /change monitor-timeout-ac 0
+          powercfg /change hibernate-timeout-ac 0
+
+      - name: Mostrar credenciais de acesso
+        shell: pwsh
+        run: |
+          Write-Host '=============================================='
+          Write-Host " DESKTOP WINDOWS PRONTO - Instância #${{ inputs.instance_number || '1' }}"
+          Write-Host '=============================================='
+          Write-Host " ID do AnyDesk : $env:ANYDESK_ID"
+          Write-Host " Senha         : $env:ANYDESK_PASS"
+          Write-Host '----------------------------------------------'
+          Write-Host ' No celular: app AnyDesk, digite o ID e toque em Conectar.'
+          Write-Host '=============================================='
+
+      - name: Salvar credenciais em arquivo
+        shell: pwsh
+        run: |
+          "ID=$env:ANYDESK_ID" | Out-File -FilePath credentials.txt -Encoding utf8
+          "SENHA=$env:ANYDESK_PASS" | Out-File -FilePath credentials.txt -Encoding utf8 -Append
+
+      - name: Publicar credenciais
+        uses: actions/upload-artifact@v4
+        with:
+          name: anydesk-credentials
+          path: credentials.txt
+          retention-days: 1
+
+      - name: Manter sessão ativa e monitorar
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $count = 0
+          while ($true) {
+            $count++
+            $svc = Get-Service -Name AnyDesk -ErrorAction SilentlyContinue
+            if ($svc -and $svc.Status -ne 'Running') {
+              Write-Host '::warning::Serviço AnyDesk parou. Tentando reiniciar...'
+              Start-Service AnyDesk -ErrorAction SilentlyContinue
+            }
+            Write-Host "[$count] Sessão ativa - $(Get-Date) - ID $env:ANYDESK_ID"
+            qwinsta 2>$null | ForEach-Object { Write-Host "[SESSÕES] $_" }
+            Start-Sleep -Seconds 60
+          }
+
+      - name: Diagnóstico final (executa mesmo se algo falhar)
+        if: always()
+        shell: pwsh
+        run: |
+          Write-Host '##### Serviço AnyDesk #####'
+          Get-Service -Name AnyDesk -ErrorAction SilentlyContinue | Format-List Name, Status
+          Write-Host '##### Processos do AnyDesk #####'
+          Get-Process -Name AnyDesk -ErrorAction SilentlyContinue | Format-Table Name, Id, StartTime -AutoSize
+          Write-Host '##### Sessões do Windows #####'
+          qwinsta 2>$null
+          Write-Host '##### Logs do AnyDesk #####'
+          $logDir = Join-Path $env:ProgramData 'AnyDesk'
+          if (Test-Path $logDir) {
+            Get-ChildItem $logDir -Filter *.trace -Recurse -ErrorAction SilentlyContinue |
+              ForEach-Object { Write-Host "--- $($_.FullName) ---"; Get-Content $_.FullName -Tail 50 }
+          } else { Write-Host 'Pasta de logs não encontrada.' }
